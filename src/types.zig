@@ -659,6 +659,105 @@ pub const Value = union(enum) {
     array: struct { elems: []const Value, elem_oid: u32 },
 };
 
+/// Renders the value the way PostgreSQL sends it in text format, into the
+/// caller's buffer (no allocation). Binary-decoded values have no string form
+/// otherwise — e.g. reading an int8 snowflake id as text.
+/// PostgreSQL sends uuid as "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"; the binary
+/// form is the same 16 bytes raw.
+fn parseUuidText(bytes: []const u8) ![16]u8 {
+    var out: [16]u8 = undefined;
+    var n: usize = 0;
+    for (bytes) |c| {
+        if (c == '-') continue;
+        const d = std.fmt.charToDigit(c, 16) catch return error.InvalidValue;
+        if (n % 2 == 0) {
+            out[n / 2] = @as(u8, @intCast(d)) << 4;
+        } else {
+            out[n / 2] |= @as(u8, @intCast(d));
+        }
+        n += 1;
+        if (n > 32) return error.InvalidValue;
+    }
+    if (n != 32) return error.InvalidValue;
+    return out;
+}
+
+pub fn valueToText(v: Value, buf: []u8) errors.Error![]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    switch (v) {
+        .null_ => return error.TypeMismatch,
+        .bool_ => |b| try w.writeAll(if (b) "t" else "f"),
+        .int => |i| try w.print("{d}", .{i}),
+        .float => |f| try w.print("{d}", .{f}),
+        .text => |t| try w.writeAll(t),
+        .bytea => |b| {
+            try w.writeAll("\\x");
+            const digits = "0123456789abcdef";
+            for (b) |byte| {
+                try w.writeByte(digits[byte >> 4]);
+                try w.writeByte(digits[byte & 0xf]);
+            }
+        },
+        .uuid => |u| {
+            const digits = "0123456789abcdef";
+            for (u, 0..) |byte, i| {
+                if (i == 4 or i == 6 or i == 8 or i == 10) try w.writeByte('-');
+                try w.writeByte(digits[byte >> 4]);
+                try w.writeByte(digits[byte & 0xf]);
+            }
+        },
+        .date => |d| try writeDate(&w, d),
+        .time => |t| try writeTime(&w, t),
+        .timestamp => |t| try writeDateTime(&w, t, false),
+        .timestamptz => |t| try writeDateTime(&w, t, true),
+        .array => return error.TypeMismatch,
+    }
+    return w.buffered();
+}
+
+fn writeDate(w: *std.Io.Writer, d: Date) !void {
+    const c = civilFromDays(d.days + days_from_1970_to_2000);
+    // unsigned: {d:0>N} on a signed value prints a leading '+'
+    if (c.y < 0) {
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2} BC", .{
+            @as(u32, @intCast(-@as(i64, c.y))),
+            @as(u32, c.m),
+            @as(u32, c.d),
+        });
+    } else {
+        try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{
+            @as(u32, @intCast(c.y)),
+            @as(u32, c.m),
+            @as(u32, c.d),
+        });
+    }
+}
+
+fn writeTime(w: *std.Io.Writer, t: Time) !void {
+    const usec = t.usec;
+    const total_sec = @divFloor(usec, std.time.us_per_s);
+    const frac: u32 = @intCast(@mod(usec, std.time.us_per_s));
+    const h: u32 = @intCast(@divFloor(total_sec, 3600));
+    const m: u32 = @intCast(@divFloor(@mod(total_sec, 3600), 60));
+    const sec: u32 = @intCast(@mod(total_sec, 60));
+    try w.print("{d:0>2}:{d:0>2}:{d:0>2}", .{ h, m, sec });
+    if (frac == 0) return;
+    var fb: [8]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&fb, ".{d:0>6}", .{frac}) catch unreachable;
+    var n: usize = rendered.len;
+    while (n > 1 and rendered[n - 1] == '0') n -= 1;
+    try w.writeAll(rendered[0..n]);
+}
+
+fn writeDateTime(w: *std.Io.Writer, t: Timestamp, tz: bool) !void {
+    const days = @divFloor(t.usec, std.time.us_per_s * std.time.s_per_day);
+    const rem = t.usec - days * std.time.us_per_s * std.time.s_per_day;
+    try writeDate(w, .{ .days = @intCast(days) });
+    try w.writeByte(' ');
+    try writeTime(w, .{ .usec = rem });
+    if (tz) try w.writeAll("+00");
+}
+
 pub const Column = struct {
     name: []const u8,
     type_oid: u32,
@@ -693,9 +792,7 @@ pub fn decodeText(arena: std.mem.Allocator, col: Column, bytes: []const u8) erro
             return .{ .text = arena.dupe(u8, bytes) catch return error.OutOfMemory };
         },
         oid.uuid => {
-            var out: [16]u8 = undefined;
-            _ = std.fmt.hexToBytes(&out, bytes) catch return error.InvalidValue;
-            return .{ .uuid = out };
+            return .{ .uuid = try parseUuidText(bytes) };
         },
         else => {
             if (isArrayOid(o)) {

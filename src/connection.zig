@@ -100,6 +100,27 @@ pub const cancel_request_code: u32 = 80877102;
 /// Statement/portal limits from PostgreSQL.
 pub const max_statement_cache: usize = 256;
 
+/// Extracts result-column type OIDs from a RowDescription payload
+/// (count, then per column: name\0, table oid, attnum, type oid, typlen,
+/// typmod, format). Returns how many OIDs were written, or 0 when the message
+/// is malformed or wider than `out`.
+pub fn parseResultOids(data: []const u8, out: []u32) usize {
+    if (data.len < 2) return 0;
+    const n = std.mem.readInt(u16, data[0..2], .big);
+    if (n == 0 or n > out.len) return 0;
+    var i: usize = 2;
+    var k: usize = 0;
+    while (k < n) : (k += 1) {
+        const z = std.mem.indexOfScalarPos(u8, data, i, 0) orelse return 0;
+        i = z + 1;
+        if (i + 18 > data.len) return 0;
+        i += 4 + 2; // table oid + attnum
+        out[k] = std.mem.readInt(u32, data[i..][0..4], .big);
+        i += 4 + 2 + 4 + 2; // type oid + typlen + typmod + format
+    }
+    return n;
+}
+
 pub const max_cached_params = 16;
 pub const max_cached_columns = 64;
 pub const unknown_result_cols: u8 = 255;
@@ -1353,19 +1374,8 @@ pub const Conn = struct {
     fn noteResultOids(c: *Conn, data: []const u8) void {
         c.last_n_result = 0;
         c.last_result_overflow = true;
-        if (data.len < 2) return;
-        const n = std.mem.readInt(u16, data[0..2], .big);
-        if (n > max_cached_columns) return;
-        var i: usize = 2;
-        var k: usize = 0;
-        while (k < n) : (k += 1) {
-            const z = std.mem.indexOfScalarPos(u8, data, i, 0) orelse return;
-            i = z + 1;
-            if (i + 4 + 2 + 4 + 2 + 2 + 2 > data.len) return;
-            i += 4 + 2;
-            c.last_result_oids[k] = std.mem.readInt(u32, data[i..][0..4], .big);
-            i += 4 + 2 + 2 + 2;
-        }
+        const n = parseResultOids(data, c.last_result_oids[0..]);
+        if (n == 0) return;
         c.last_n_result = n;
         c.last_result_overflow = false;
     }

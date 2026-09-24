@@ -70,6 +70,7 @@ pub const Row = result_mod.Row;
 pub const Describe = result_mod.Describe;
 pub const Column = types.Column;
 pub const Value = types.Value;
+pub const valueToText = types.valueToText;
 pub const State = result_mod.State;
 
 pub const Diagnostics = errors.Diagnostics;

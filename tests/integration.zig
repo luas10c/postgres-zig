@@ -37,6 +37,7 @@ test {
     defer threaded.deinit();
     const io = threaded.io();
     const gpa = std.heap.page_allocator;
+    const types = postgres_mod.types;
 
     var db = connectDb(io, gpa) catch |e| switch (e) {
         error.SkipDbUnavailable => {
@@ -502,6 +503,62 @@ test {
                 try std.testing.expectError(error.TypeMismatch, row.getAt(i16, 2));
                 try std.testing.expectError(error.TypeMismatch, row.getAt(bool, 1));
                 std.debug.print("  {s} {s} exec: ok\n", .{ tag, label });
+            }
+        }
+    }
+
+    {
+        // big ids (Discord snowflakes): int8 read as i64/u64 and as text,
+        // on the first (text) and the cached (binary) execution
+        const snow = "1098316516774129684";
+        inline for (.{ false, true }) |binary_first| {
+            var conn = postgres(io, gpa, .{
+                .url = url(),
+                .max = 1,
+                .binary_first_exec = binary_first,
+            }) catch |e| switch (e) {
+                error.ConnectFailed, error.UnknownHostName => {
+                    skipped = true;
+                    return error.SkipDbUnavailable;
+                },
+                else => return e,
+            };
+            defer conn.deinit();
+
+            inline for (.{ 0, 1 }) |run| {
+                var res = try conn.query(
+                    "select {}::int8 as id, {}::numeric as num, {}::uuid as u, {}::bool as b",
+                    .{ @as(i64, 1098316516774129684), @as(i64, 42), "550e8400-e29b-41d4-a716-446655440000", true },
+                );
+                defer res.deinit();
+                const row = res.first().?;
+                const label = if (run == 0) "1st" else "2nd";
+                _ = label;
+
+                try std.testing.expectEqual(@as(i64, 1098316516774129684), try row.getAt(i64, 0));
+                try std.testing.expectEqual(@as(u64, 1098316516774129684), try row.getAt(u64, 0));
+                try std.testing.expectEqual(@as(i64, 42), try row.getAt(i64, 1));
+
+                var b1: [48]u8 = undefined;
+                var b2: [48]u8 = undefined;
+                var b3: [48]u8 = undefined;
+                var b4: [48]u8 = undefined;
+                try std.testing.expectEqualStrings(snow, try row.getText(&b1, "id"));
+                try std.testing.expectEqualStrings("42", try row.getText(&b2, "num"));
+                try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", try row.getText(&b3, "u"));
+                try std.testing.expectEqualStrings("t", try row.getText(&b4, "b"));
+
+                // uuid: [16]u8 read works on both wire formats, and its text
+                // rendering must agree with the decoded value
+                const u = try row.get([16]u8, "u");
+                var ubuf: [48]u8 = undefined;
+                var ubuf2: [48]u8 = undefined;
+                try std.testing.expectEqualStrings(
+                    try row.getText(&ubuf, "u"),
+                    try types.valueToText(.{ .uuid = u }, &ubuf2),
+                );
+                // reading a uuid as int is still a type error
+                try std.testing.expectError(error.TypeMismatch, row.getAt(i32, 2));
             }
         }
     }

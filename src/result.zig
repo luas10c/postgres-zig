@@ -81,6 +81,24 @@ pub const Row = struct {
         if (index >= self.values.len) return error.UndefinedColumn;
         return types.coerce(T, self.values[index]);
     }
+
+    /// Text form of a column, rendered into `buf` (no allocation). Works for
+    /// every type, including binary-decoded ones (int8 id, uuid, timestamps)
+    /// that have no string variant in `Value`.
+    /// Each call needs its own buffer: the result borrows `buf`.
+    pub fn getText(self: Row, buf: []u8, name: []const u8) errors.Error![]const u8 {
+        for (self.columns, 0..) |col, i| {
+            if (std.mem.eql(u8, col.name, name)) {
+                return types.valueToText(self.values[i], buf);
+            }
+        }
+        return error.UndefinedColumn;
+    }
+
+    pub fn getTextAt(self: Row, buf: []u8, index: usize) errors.Error![]const u8 {
+        if (index >= self.values.len) return error.UndefinedColumn;
+        return types.valueToText(self.values[index], buf);
+    }
 };
 
 /// Describe-only result (`` sql`...`.describe() `` parity).

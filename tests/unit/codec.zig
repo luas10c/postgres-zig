@@ -11,6 +11,18 @@ const daysFromCivil = types.daysFromCivil;
 const civilFromDays = types.civilFromDays;
 const days_from_1970_to_2000 = types.days_from_1970_to_2000;
 const oid = types.oid;
+const valueToText = types.valueToText;
+
+fn decodeTextForTest(text: []const u8, type_oid: u32) !types.Value {
+    return types.decodeText(std.testing.allocator, .{
+        .name = "v",
+        .type_oid = type_oid,
+        .typlen = -1,
+        .format = 0,
+        .table_oid = 0,
+        .attnum = 0,
+    }, text);
+}
 
 test "civil roundtrip" {
     try std.testing.expectEqual(@as(i32, 0), daysFromCivil(1970, 1, 1));
@@ -76,4 +88,44 @@ test "coerce accepts text wire values for int/bool/float" {
     try std.testing.expectError(error.TypeMismatch, coerce(i16, .{ .int = 40000 }));
     try std.testing.expectError(error.TypeMismatch, coerce(i32, .{ .bool_ = true }));
     try std.testing.expectError(error.TypeMismatch, coerce(i32, .{ .uuid = [_]u8{0} ** 16 }));
+}
+
+test "valueToText renders every scalar the way PostgreSQL does" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1098316516774129684", try valueToText(.{ .int = 1098316516774129684 }, &buf));
+    try std.testing.expectEqualStrings("-9223372036854775808", try valueToText(.{ .int = std.math.minInt(i64) }, &buf));
+    try std.testing.expectEqualStrings("t", try valueToText(.{ .bool_ = true }, &buf));
+    try std.testing.expectEqualStrings("f", try valueToText(.{ .bool_ = false }, &buf));
+    try std.testing.expectEqualStrings("1.5", try valueToText(.{ .float = 1.5 }, &buf));
+    try std.testing.expectEqualStrings("plain", try valueToText(.{ .text = "plain" }, &buf));
+    try std.testing.expectEqualStrings("\\xdeadbeef", try valueToText(.{ .bytea = &[_]u8{ 0xde, 0xad, 0xbe, 0xef } }, &buf));
+
+    var uuid: [16]u8 = undefined;
+    _ = std.fmt.hexToBytes(&uuid, "550e8400e29b41d4a716446655440000") catch unreachable;
+    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", try valueToText(.{ .uuid = uuid }, &buf));
+
+    const days: i32 = daysFromCivil(2026, 9, 23) - days_from_1970_to_2000;
+    try std.testing.expectEqualStrings("2026-09-23", try valueToText(.{ .date = .{ .days = days } }, &buf));
+    try std.testing.expectEqualStrings("00:00:00", try valueToText(.{ .time = .{ .usec = 0 } }, &buf));
+    try std.testing.expectEqualStrings("18:53:00.5", try valueToText(.{ .time = .{ .usec = 18 * 3600 * std.time.us_per_s + 53 * 60 * std.time.us_per_s + 500_000 } }, &buf));
+
+    const ts_usec = @as(i64, days) * 86_400 * std.time.us_per_s +
+        (18 * 3600 + 53 * 60) * std.time.us_per_s + 500_000;
+    try std.testing.expectEqualStrings("2026-09-23 18:53:00.5", try valueToText(.{ .timestamp = .{ .usec = ts_usec } }, &buf));
+    try std.testing.expectEqualStrings("2026-09-23 18:53:00.5+00", try valueToText(.{ .timestamptz = .{ .usec = ts_usec } }, &buf));
+
+    // unsupported / NULL have no text form through this API
+    try std.testing.expectError(error.TypeMismatch, valueToText(.null_, &buf));
+    try std.testing.expectError(error.TypeMismatch, valueToText(.{ .array = .{ .elems = &.{}, .elem_oid = 23 } }, &buf));
+    try std.testing.expectError(error.WriteFailed, valueToText(.{ .text = "0123456789" }, buf[0..4]));
+}
+
+test "uuid text parsing accepts hyphens and rejects junk" {
+    var buf2: [64]u8 = undefined;
+    const good = try decodeTextForTest("550e8400-e29b-41d4-a716-446655440000", 2950);
+    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", try valueToText(good, &buf2));
+    const nohyphen = try decodeTextForTest("550e8400e29b41d4a716446655440000", 2950);
+    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", try valueToText(nohyphen, &buf2));
+    try std.testing.expectError(error.InvalidValue, decodeTextForTest("not-a-uuid", 2950));
+    try std.testing.expectError(error.InvalidValue, decodeTextForTest("550e8400-e29b-41d4-a716-44665544000", 2950));
 }

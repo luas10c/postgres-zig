@@ -256,6 +256,20 @@ Notas de segurança: `sslmode=require` **sempre** verifica certificado + hostnam
 | arrays (`int[]`, `text[]`…) | slices (`[]?i64`, `[]const []const u8`) | slices |
 | NULL | `?T` | `null` / `?T` |
 
+`row.get([]const u8, col)` só funciona quando o valor é texto. Para ler um valor
+binário (int8, uuid, timestamp, bool) como string use `row.getText(buf, col)`
+(ou `getTextAt(buf, i)`) — ele renderiza no formato de texto do PostgreSQL
+usando o buffer que você passa, sem alocar:
+
+```zig
+var buf: [32]u8 = undefined;
+const guild_id = try row.getText(&buf, "guild_id"); // "1098316516774129684"
+```
+
+Cada chamada precisa do seu próprio buffer (o resultado é emprestado).
+Para IDs grandes, prefira `i64`/`u64` a `f64`: um snowflake do Discord
+(1,09e18) perde precisão em `f64`.
+
 Resultados chegam em formato texto (como no postgres.js) e são convertidos sob demanda; parâmetros escalares vão em formato binário.
 
 ## Testes
