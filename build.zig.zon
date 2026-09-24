@@ -10,5 +10,10 @@
         "tests",
         "README.md",
     },
-    .dependencies = .{},
+    .dependencies = .{
+        .pg = .{
+            .url = "git+https://github.com/karlseguin/pg.zig#2c7c6cae50a32fa5cc53eabf490a072f41d6f3b0",
+            .hash = "pg-0.0.0-Wp_7gYHeBgAD8sCL-4MUhOs3K14n-Fu4EquuoB-BNVo5",
+        },
+    },
 }
