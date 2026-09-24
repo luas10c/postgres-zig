@@ -147,11 +147,7 @@ pub const Postgres = struct {
         };
         var exec_err: ?errors.Error = null;
         {
-            var sink = conn_mod.RowsSink{
-                .gpa = self.gpa,
-                .arena = res.arena(),
-                .max_bytes = self.max_result_bytes,
-            };
+            var sink = conn_mod.RowsSink.init(res.arena(), self.max_result_bytes);
 
             const eo = conn_mod.Conn.ExecOptions{
                 .sink = .{ .rows = &sink },
@@ -211,18 +207,12 @@ pub const Postgres = struct {
     /// the memory the Result now points to.
     fn fillResult(self: *Postgres, c: *Conn, sink: *conn_mod.RowsSink, res: *Result) errors.Error!void {
         _ = self;
-        const a = res.arena();
         res.columns = sink.columns.items;
         sink.columns.items.len = 0;
-        const values = sink.rows.items;
-        const rows = a.alloc(Row, values.len) catch return error.OutOfMemory;
-        for (values, 0..) |vals, i| {
-            rows[i] = .{ .values = vals, .columns = res.columns };
-        }
+        res.rows = sink.rows.items;
         sink.rows.items.len = 0;
-        res.rows = rows;
         res.count = sink.count;
-        res.command_tag = a.dupe(u8, sink.command_tag) catch return error.OutOfMemory;
+        res.command_tag = sink.command_tag;
         res.state = .{ .pid = c.pid, .secret = c.secret };
     }
 
@@ -232,7 +222,7 @@ pub const Postgres = struct {
         var res = Result{ .arena_state = std.heap.ArenaAllocator.init(self.gpa), .transform = self.transform };
         var exec_err: ?errors.Error = null;
         {
-            var sink = conn_mod.RowsSink{ .gpa = self.gpa, .arena = res.arena(), .max_bytes = self.max_result_bytes };
+            var sink = conn_mod.RowsSink.init(res.arena(), self.max_result_bytes);
             c.execSimple(sql, .{ .sink = .{ .rows = &sink } }) catch |e| {
                 exec_err = e;
             };
@@ -264,7 +254,7 @@ pub const Postgres = struct {
         var res = Result{ .arena_state = std.heap.ArenaAllocator.init(self.gpa), .transform = self.transform };
         var exec_err: ?errors.Error = null;
         {
-            var sink = conn_mod.RowsSink{ .gpa = self.gpa, .arena = res.arena(), .max_bytes = self.max_result_bytes };
+            var sink = conn_mod.RowsSink.init(res.arena(), self.max_result_bytes);
 
             const has_args = blk: {
                 const info = @typeInfo(@TypeOf(args));
@@ -314,7 +304,7 @@ pub const Postgres = struct {
         var desc = Describe{ .arena_state = std.heap.ArenaAllocator.init(self.gpa) };
         var exec_err: ?errors.Error = null;
         {
-            var sink = conn_mod.RowsSink{ .gpa = self.gpa, .arena = desc.arena_state.allocator(), .max_bytes = self.max_result_bytes };
+            var sink = conn_mod.RowsSink.init(desc.arena_state.allocator(), self.max_result_bytes);
 
             var param_oids: std.ArrayList(u32) = .empty;
             defer param_oids.deinit(self.gpa);
@@ -471,13 +461,7 @@ pub const Postgres = struct {
         }
         for (staged, 0..) |it, i| {
             results[i] = .{ .arena_state = std.heap.ArenaAllocator.init(self.gpa), .transform = self.transform };
-            var sink = conn_mod.RowsSink{
-                .gpa = self.gpa,
-                .arena = results[i].arena(),
-                .max_bytes = self.max_result_bytes,
-                .columns = .empty,
-                .rows = .empty,
-            };
+            var sink = conn_mod.RowsSink.init(results[i].arena(), self.max_result_bytes);
             var eo = conn_mod.Conn.ExecOptions{ .sink = .{ .rows = &sink } };
             if (cached_flags[i]) {
                 if (c.cachedResultOids(it.name, it.oids)) |roids| eo.result_formats = c.resultFormatsFor(roids);
@@ -547,12 +531,7 @@ pub const Postgres = struct {
             .batch = if (batch == 0) 1 else batch,
             .batch_arena = std.heap.ArenaAllocator.init(self.gpa),
         };
-        cur.pending = .{
-            .gpa = self.gpa,
-            .arena = cur.batch_arena.allocator(),
-            .columns = .empty,
-            .rows = .empty,
-        };
+        cur.pending = conn_mod.RowsSink.init(cur.batch_arena.allocator(), self.max_result_bytes);
         var suspended = false;
         c.execQuery(q, args, .{
             .use_sync = false,
@@ -691,7 +670,7 @@ pub const Tx = struct {
             .arena_state = std.heap.ArenaAllocator.init(self.pg.gpa),
             .transform = self.pg.transform,
         };
-        var sink = conn_mod.RowsSink{ .gpa = self.pg.gpa, .arena = res.arena(), .max_bytes = self.pg.max_result_bytes };
+        var sink = conn_mod.RowsSink.init(res.arena(), self.pg.max_result_bytes);
 
         const eo = conn_mod.Conn.ExecOptions{
             .sink = .{ .rows = &sink },
@@ -717,7 +696,7 @@ pub const Tx = struct {
             .arena_state = std.heap.ArenaAllocator.init(self.pg.gpa),
             .transform = self.pg.transform,
         };
-        var sink = conn_mod.RowsSink{ .gpa = self.pg.gpa, .arena = res.arena(), .max_bytes = self.pg.max_result_bytes };
+        var sink = conn_mod.RowsSink.init(res.arena(), self.pg.max_result_bytes);
         c.execSimple(sql, .{ .sink = .{ .rows = &sink } }) catch |e| {
             self.pg.recordDiag(c);
             c.drainToReady() catch {};
@@ -861,13 +840,7 @@ pub const Cursor = struct {
         if (self.done) return null;
 
         _ = self.batch_arena.reset(.retain_capacity);
-        self.pending = .{
-            .gpa = self.pg.gpa,
-            .arena = self.batch_arena.allocator(),
-            .max_bytes = self.pg.max_result_bytes,
-            .columns = .empty,
-            .rows = .empty,
-        };
+        self.pending = conn_mod.RowsSink.init(self.batch_arena.allocator(), self.pg.max_result_bytes);
 
         var suspended = false;
         self.conn.writeExecute(self.batch) catch |e| return self.fail(e);
@@ -884,14 +857,7 @@ pub const Cursor = struct {
     }
 
     fn buildRows(self: *Cursor) errors.Error!?[]Row {
-        const a = self.batch_arena.allocator();
-        const rows = a.alloc(Row, self.pending.rows.items.len) catch return error.OutOfMemory;
-        const columns = self.pending.columns.items;
-        self.pending.columns.items.len = 0;
-        for (self.pending.rows.items, 0..) |vals, i| {
-            rows[i] = .{ .values = vals, .columns = columns };
-        }
-        self.pending.rows.items.len = 0;
+        const rows = self.pending.rows.items;
         if (rows.len == 0 and self.done) return null;
         return rows;
     }

@@ -4,6 +4,7 @@ const options = @import("options.zig");
 const scram = @import("scram.zig");
 const types = @import("types.zig");
 const query = @import("query.zig");
+const result_mod = @import("result.zig");
 
 /// >= std.crypto.tls min_buffer_len
 const io_min_buffer = 32 * 1024;
@@ -14,6 +15,7 @@ fn nowNs(io: std.Io) i128 {
 
 pub const Column = types.Column;
 pub const Value = types.Value;
+pub const Row = result_mod.Row;
 
 /// Shared per-Postgres TLS context (CA bundle, lazily loaded once).
 pub const TlsCtx = struct {
@@ -110,17 +112,100 @@ const CacheEntry = struct {
     result_oids: [max_cached_columns]u32 = undefined,
 };
 
+/// Bump allocator over arena-backed chunks. One arena allocation serves many
+/// rows, so per-row work is a pointer bump instead of an arena alloc (which
+/// costs an atomic RMW per call). Chunks double up to `max_chunk`.
+pub const Bump = struct {
+    arena: std.mem.Allocator,
+    chunk: []u8 = &.{},
+    pos: usize = 0,
+
+    pub const first_chunk = 8 * 1024;
+    pub const max_chunk = 128 * 1024;
+
+    pub fn alloc(b: *Bump, n: usize, alignment: std.mem.Alignment) errors.Error![]u8 {
+        const a = alignment.toByteUnits();
+        const off = std.mem.alignForward(usize, b.pos, a);
+        if (off + n > b.chunk.len) {
+            const want = if (n + a > max_chunk) n + a else @min(@max(n + a, @max(b.chunk.len * 2, first_chunk)), max_chunk);
+            b.chunk = b.arena.alloc(u8, want) catch return error.OutOfMemory;
+            b.pos = n;
+            return b.chunk[0..n];
+        }
+        b.pos = off + n;
+        return b.chunk[off..][0..n];
+    }
+
+    /// Reuse the current chunk from the start. Only valid when everything
+    /// handed out so far has been discarded (multi-statement simple queries).
+    pub fn reset(b: *Bump) void {
+        b.pos = 0;
+    }
+
+    const vtable = std.mem.Allocator.VTable{
+        .alloc = allocFn,
+        .resize = resizeFn,
+        .remap = remapFn,
+        .free = freeFn,
+    };
+
+    pub fn allocator(b: *Bump) std.mem.Allocator {
+        return .{ .ptr = b, .vtable = &vtable };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        _ = ret_addr;
+        if (len == 0) return @constCast(&[_]u8{});
+        const b: *Bump = @ptrCast(@alignCast(ctx));
+        const out = b.alloc(len, alignment) catch return null;
+        return out.ptr;
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return false;
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        _ = ctx;
+        _ = memory;
+        _ = alignment;
+        _ = ret_addr;
+    }
+};
+
 /// Materializes rows into an arena (regular queries).
 pub const RowsSink = struct {
-    gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     max_bytes: usize = std.math.maxInt(usize),
     bytes: usize = 0,
     columns: std.ArrayList(Column) = .empty,
-    rows: std.ArrayList([]Value) = .empty,
+    rows: std.ArrayList(Row) = .empty,
+    values: Bump,
     count: i64 = 0,
     command_tag: []const u8 = "",
     statement_started: bool = false,
+
+    pub fn init(arena: std.mem.Allocator, max_bytes: usize) RowsSink {
+        return .{
+            .arena = arena,
+            .max_bytes = max_bytes,
+            .values = .{ .arena = arena },
+        };
+    }
 };
 
 /// Streams rows one at a time through a callback (forEach / iter).
@@ -1234,6 +1319,7 @@ pub const Conn = struct {
                 if (s.statement_started) {
                     s.columns.items.len = 0;
                     s.rows.items.len = 0;
+                    s.values.reset();
                 }
                 s.statement_started = true;
                 try parseRowDescription(data, s.arena, &s.columns);
@@ -1253,8 +1339,8 @@ pub const Conn = struct {
                 if (s.columns.items.len == 0) return error.ProtocolError;
                 s.bytes += data.len;
                 if (s.bytes > s.max_bytes) return error.ResultTooLarge;
-                const values = try parseDataRow(c, data, s.columns.items, s.arena, raw, formats);
-                try s.rows.append(s.arena, values);
+                const values = try parseDataRow(c, data, s.columns.items, s.values.allocator(), raw, formats);
+                try s.rows.append(s.arena, .{ .values = values, .columns = s.columns.items });
             },
             .stream => |s| {
                 if (s.columns.items.len == 0) return error.ProtocolError;

@@ -115,7 +115,7 @@ pub const Pool = struct {
 
         if (r.unix_path != null) {
             const c = try conn_mod.Conn.open(p.conn_ctx, 0);
-            try p.checkSessionAttrs(c, attrs);
+            try checkSessionAttrs(c, attrs);
             return c;
         }
 
@@ -125,7 +125,7 @@ pub const Pool = struct {
                 last_err = e;
                 continue;
             };
-            p.checkSessionAttrs(c, attrs) catch |e| {
+            checkSessionAttrs(c, attrs) catch |e| {
                 c.close();
                 last_err = e;
                 continue;
@@ -135,31 +135,27 @@ pub const Pool = struct {
         return last_err;
     }
 
-    fn checkSessionAttrs(p: *Pool, c: *Conn, attrs: options.TargetSessionAttrs) errors.Error!void {
+    fn checkSessionAttrs(c: *Conn, attrs: options.TargetSessionAttrs) errors.Error!void {
         if (attrs == .any) return;
-        var sink = conn_mod.RowsSink{
-            .gpa = p.gpa,
-            .arena = c.diag_arena.allocator(),
-            .max_bytes = c.ctx.max_result_bytes,
-        };
+        var sink = conn_mod.RowsSink.init(c.diag_arena.allocator(), c.ctx.max_result_bytes);
 
         switch (attrs) {
             .any => {},
             .read_write, .read_only => {
                 try c.execSimple("show transaction_read_only", .{ .sink = .{ .rows = &sink } });
                 const ro = sink.rows.items.len > 0 and
-                    sink.rows.items[0].len > 0 and
-                    sink.rows.items[0][0] == .text and
-                    std.mem.eql(u8, sink.rows.items[0][0].text, "on");
+                    sink.rows.items[0].values.len > 0 and
+                    sink.rows.items[0].values[0] == .text and
+                    std.mem.eql(u8, sink.rows.items[0].values[0].text, "on");
                 if (attrs == .read_write and ro) return error.ConnectFailed;
                 if (attrs == .read_only and !ro) return error.ConnectFailed;
             },
             .primary, .standby, .prefer_standby => {
                 try c.execSimple("select pg_is_in_recovery()", .{ .sink = .{ .rows = &sink } });
                 const rec = sink.rows.items.len > 0 and
-                    sink.rows.items[0].len > 0 and
-                    sink.rows.items[0][0] == .bool_ and
-                    sink.rows.items[0][0].bool_;
+                    sink.rows.items[0].values.len > 0 and
+                    sink.rows.items[0].values[0] == .bool_ and
+                    sink.rows.items[0].values[0].bool_;
                 if (attrs == .primary and rec) return error.ConnectFailed;
                 if (attrs == .standby and !rec) return error.ConnectFailed;
             },

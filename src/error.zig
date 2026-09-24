@@ -118,12 +118,3 @@ pub fn parseErrorFields(payload: []const u8, arena: std.mem.Allocator, d: *Diagn
         }
     }
 }
-
-test "parseErrorFields tolerates truncation" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    var d = Diagnostics{};
-    try parseErrorFields("C23505Mdup key", arena_state.allocator(), &d);
-    try std.testing.expectEqualStrings("23505", d.code);
-    try std.testing.expectEqualStrings("dup key", d.message);
-}

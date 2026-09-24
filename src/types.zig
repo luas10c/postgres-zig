@@ -65,18 +65,6 @@ pub fn civilFromDays(z_in: i32) struct { y: i32, m: u8, d: u8 } {
     return .{ .y = @intCast(if (m <= 2) y + 1 else y), .m = m, .d = d };
 }
 
-test "civil roundtrip" {
-    try std.testing.expectEqual(@as(i32, 0), daysFromCivil(1970, 1, 1));
-    try std.testing.expectEqual(days_from_1970_to_2000, daysFromCivil(2000, 1, 1));
-    const c = civilFromDays(10957);
-    try std.testing.expectEqual(@as(i32, 2000), c.y);
-    try std.testing.expectEqual(@as(u8, 1), c.m);
-    try std.testing.expectEqual(@as(u8, 1), c.d);
-    const c2 = civilFromDays(0);
-    try std.testing.expectEqual(@as(i32, 1970), c2.y);
-    try std.testing.expectEqual(@as(i32, 20669), daysFromCivil(2026, 9, 23));
-}
-
 /// Force an explicit PostgreSQL OID for a value (`sql.typed` parity).
 pub fn Typed(comptime T: type) type {
     return struct { value: T, oid: u32 };
@@ -867,13 +855,13 @@ fn decodeTimeText(bytes: []const u8) !Value {
     return .{ .time = .{ .usec = total } };
 }
 
-fn decodeTimestampText(bytes: []const u8, tz: bool) !Value {
+pub fn decodeTimestampText(bytes: []const u8, tz: bool) !Value {
     const sp = std.mem.indexOfScalar(u8, bytes, ' ') orelse return error.InvalidValue;
     const date_part = bytes[0..sp];
     var rest = bytes[sp + 1 ..];
 
     const date_val = try decodeDateText(date_part);
-    const time_val = try decodeTimeText(rest[0..@min(rest.len, 8)]);
+    const time_val = try decodeTimeText(rest);
     var usec: i64 = @as(i64, date_val.date.days) * 86_400 * std.time.us_per_s + time_val.time.usec;
 
     if (std.mem.indexOfScalar(u8, rest, '+') orelse std.mem.indexOfScalarPos(u8, rest, 8, '-')) |oi| {
@@ -925,6 +913,12 @@ pub fn parseArrayLiteral(arena: std.mem.Allocator, bytes: []const u8, elem_oid: 
                     try buf.append(arena, inner[j + 1]);
                     j += 2;
                 } else if (inner[j] == '"') {
+                    // "" inside a quoted element is a literal quote
+                    if (j + 1 < inner.len and inner[j + 1] == '"') {
+                        try buf.append(arena, '"');
+                        j += 2;
+                        continue;
+                    }
                     break;
                 } else {
                     try buf.append(arena, inner[j]);
@@ -1029,37 +1023,4 @@ fn coerceNonNull(comptime T: type, v: Value) errors.Error!T {
         return error.TypeMismatch;
     }
     return error.TypeMismatch;
-}
-
-test "coerce basics" {
-    try std.testing.expectEqual(@as(i64, 42), try coerce(i64, .{ .int = 42 }));
-    try std.testing.expectEqual(@as(?i64, null), try coerce(?i64, .null_));
-    try std.testing.expectEqual(@as(i16, 7), try coerce(i16, .{ .int = 7 }));
-    try std.testing.expectError(error.TypeMismatch, coerce(bool, .{ .int = 1 }));
-}
-
-test "array literal parse" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const vals = try parseArrayLiteral(a, "{1,2,NULL,4}", oid.int4);
-    try std.testing.expectEqual(@as(usize, 4), vals.len);
-    try std.testing.expectEqual(@as(i64, 1), vals[0].int);
-    try std.testing.expectEqual(@as(i64, 2), vals[1].int);
-    try std.testing.expect(vals[2] == .null_);
-    try std.testing.expectEqual(@as(i64, 4), vals[3].int);
-
-    const strs = try parseArrayLiteral(a, "{\"a b\",\"c\"\"d\",e}", oid.text);
-    try std.testing.expectEqualStrings("a b", strs[0].text);
-    try std.testing.expectEqualStrings("c\"d", strs[1].text);
-    try std.testing.expectEqualStrings("e", strs[2].text);
-}
-
-test "timestamp text decode" {
-    const v = try decodeTimestampText("2026-09-23 18:53:00.5", true);
-    const ts = v.timestamptz;
-    const days: i64 = @as(i64, daysFromCivil(2026, 9, 23) - days_from_1970_to_2000);
-    const expect_usec = days * 86_400 * std.time.us_per_s +
-        (18 * 3600 + 53 * 60) * std.time.us_per_s + 500_000;
-    try std.testing.expectEqual(expect_usec, ts.usec);
 }

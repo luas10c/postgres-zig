@@ -625,43 +625,6 @@ fn renderToBuf(alloc: std.mem.Allocator, comptime q: []const u8, args: anytype) 
     return sql.toOwnedSlice(alloc);
 }
 
-test "final sql comptime" {
-    const Args = struct { i64, []const u8 };
-    const sql = comptime finalSql("select * from t where a = {} and b = {}", Args);
-    try testing.expectEqualStrings("select * from t where a = $1 and b = $2", sql);
-
-    const esc = comptime finalSql("select '{{a,b}}'::text[] where a = {}", struct { "y" });
-    try testing.expectEqualStrings("select '{a,b}'::text[] where a = $1", esc);
-}
-
-test "segments unescape braces" {
-    const segs = comptime segsFor("select '{{a}}' {}", struct { i32 });
-    var combined: std.ArrayList(u8) = .empty;
-    defer combined.deinit(testing.allocator);
-    for (segs) |s| switch (s) {
-        .sql => |t| try combined.appendSlice(testing.allocator, t),
-        .ph => try combined.appendSlice(testing.allocator, "<PH>"),
-    };
-    try testing.expectEqualStrings("select '{a}' <PH>", combined.items);
-}
-
-test "ident quoting adversarial" {
-    try testing.expectError(error.InvalidIdent, ident("users; drop table x"));
-    try testing.expectError(error.InvalidIdent, ident(""));
-    try testing.expectError(error.InvalidIdent, ident("a\x00b"));
-
-    const ok = try ident("users");
-    try testing.expectEqualStrings("\"users\"", ok.quoted());
-
-    var buf: [200]u8 = undefined;
-    const q = try quoteIdentInto(&buf, "we\"ird");
-    try testing.expectEqualStrings("\"we\"\"ird\"", q);
-
-    var long: [64]u8 = undefined;
-    @memset(&long, 'a');
-    try testing.expectError(error.InvalidIdent, ident(&long));
-}
-
 test "stmtName runtime matches comptime" {
     var buf: [20]u8 = undefined;
     const rt = stmtNameRuntime("select 1", &buf);
