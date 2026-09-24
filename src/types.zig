@@ -958,26 +958,51 @@ pub fn coerce(comptime T: type, v: Value) errors.Error!T {
     return coerceNonNull(T, v);
 }
 
+/// Text is accepted wherever an integer/float/bool is expected: the first
+/// execution of a prepared statement (and every simple-protocol query) returns
+/// text results, so `getAt(i32, ..)` must not depend on the wire format.
+fn intFromValue(v: Value, comptime T: type) errors.Error!T {
+    return switch (v) {
+        .int => |i| std.math.cast(T, i) orelse return error.TypeMismatch,
+        .text => |t| std.fmt.parseInt(T, t, 10) catch return error.InvalidValue,
+        else => error.TypeMismatch,
+    };
+}
+
+fn floatFromValue(v: Value, comptime T: type) errors.Error!T {
+    return switch (v) {
+        .float => |f| @floatCast(f),
+        .int => |i| @floatFromInt(i),
+        .text => |t| std.fmt.parseFloat(T, t) catch return error.InvalidValue,
+        else => error.TypeMismatch,
+    };
+}
+
+fn boolFromValue(v: Value) errors.Error!bool {
+    return switch (v) {
+        .bool_ => |b| b,
+        .text => |t| blk: {
+            if (t.len == 0) return error.InvalidValue;
+            break :blk switch (t[0]) {
+                't', 'T', 'y', 'Y', '1' => true,
+                'f', 'F', 'n', 'N', '0' => false,
+                else => return error.InvalidValue,
+            };
+        },
+        else => error.TypeMismatch,
+    };
+}
+
 fn coerceNonNull(comptime T: type, v: Value) errors.Error!T {
     switch (T) {
-        bool => if (v == .bool_) return v.bool_ else return error.TypeMismatch,
-        i16 => if (v == .int) return @intCast(v.int) else return error.TypeMismatch,
-        i32 => if (v == .int) return @intCast(v.int) else return error.TypeMismatch,
-        i64 => if (v == .int) return v.int else return error.TypeMismatch,
-        u16, u32 => if (v == .int) {
-            if (v.int < 0 or v.int > std.math.maxInt(T)) return error.TypeMismatch;
-            return @intCast(v.int);
-        } else return error.TypeMismatch,
-        f32 => return switch (v) {
-            .float => |f| @floatCast(f),
-            .int => |i| @floatFromInt(i),
-            else => error.TypeMismatch,
-        },
-        f64 => return switch (v) {
-            .float => |f| f,
-            .int => |i| @floatFromInt(i),
-            else => error.TypeMismatch,
-        },
+        bool => return boolFromValue(v),
+        i16 => return intFromValue(v, i16),
+        i32 => return intFromValue(v, i32),
+        i64 => return intFromValue(v, i64),
+        i8 => return intFromValue(v, i8),
+        u16, u32, u8, u64, usize => return intFromValue(v, T),
+        f32 => return floatFromValue(v, f32),
+        f64 => return floatFromValue(v, f64),
         []const u8 => return switch (v) {
             .text => |t| t,
             .bytea => |b| b,

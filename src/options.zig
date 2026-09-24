@@ -52,6 +52,9 @@ pub const Options = struct {
     query_timeout: ?u64 = null,
 
     prepare: bool = true,
+    /// Describe first execution of a prepared statement so it can request
+    /// binary results too (one extra round trip per new statement).
+    binary_first_exec: bool = false,
     target_session_attrs: TargetSessionAttrs = .any,
     application_name: []const u8 = "postgres-zig",
     /// Extra startup parameters (`key`, `value` pairs). Keys are validated.

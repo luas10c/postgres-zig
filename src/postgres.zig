@@ -52,6 +52,7 @@ pub fn connect(io: std.Io, gpa: std.mem.Allocator, opts: options.Options) errors
         .allow_insecure_auth = opts.allow_insecure_auth,
         .max_message_bytes = opts.max_message_bytes,
         .max_result_bytes = opts.max_result_bytes,
+        .binary_first_exec = opts.binary_first_exec,
     };
     p.pool = pool_mod.Pool.init(gpa, io, &p.conn_ctx);
     p.transform = opts.transform_column;
@@ -530,6 +531,7 @@ pub const Postgres = struct {
             .conn = c,
             .batch = if (batch == 0) 1 else batch,
             .batch_arena = std.heap.ArenaAllocator.init(self.gpa),
+            .cols_arena = std.heap.ArenaAllocator.init(self.gpa),
         };
         cur.pending = conn_mod.RowsSink.init(cur.batch_arena.allocator(), self.max_result_bytes);
         var suspended = false;
@@ -555,6 +557,31 @@ pub const Postgres = struct {
         };
         cur.done = !suspended;
         cur.have_pending = true;
+        // Keep the first RowDescription for the resumed batches, names
+        // included: they point into the per-batch arena we reset every batch.
+        {
+            const ca = cur.cols_arena.allocator();
+            const src = cur.pending.columns.items;
+            const cols = ca.alloc(Column, src.len) catch {
+                cur.batch_arena.deinit();
+                cur.cols_arena.deinit();
+                self.pool.discard(c);
+                return error.OutOfMemory;
+            };
+            for (src, 0..) |col, i| {
+                cols[i] = col;
+                cols[i].name = ca.dupe(u8, col.name) catch {
+                    cur.batch_arena.deinit();
+                    cur.cols_arena.deinit();
+                    self.pool.discard(c);
+                    return error.OutOfMemory;
+                };
+            }
+            cur.columns = .{ .items = cols, .capacity = cols.len };
+        }
+        cur.pending.columns.items.len = 0;
+        cur.format_len = @min(c.last_exec_format_len, cur.formats.len);
+        @memcpy(cur.formats[0..cur.format_len], c.last_result_formats[0..cur.format_len]);
         return cur;
     }
 
@@ -828,6 +855,16 @@ pub const Cursor = struct {
     done: bool = false,
     have_pending: bool = false,
     batch_arena: std.heap.ArenaAllocator,
+    /// Column metadata outlives the per-batch arena: the server does not repeat
+    /// RowDescription when an open portal is resumed.
+    cols_arena: std.heap.ArenaAllocator,
+    columns: std.ArrayList(Column) = .empty,
+    /// Result formats the portal was bound with; resumed batches come back in
+    /// the same encoding, so the decoder must be told every time.
+    formats: [conn_mod.max_cached_columns]u8 = undefined,
+    format_len: usize = 0,
+    broken: bool = false,
+    released: bool = false,
     pending: conn_mod.RowsSink = undefined,
 
     /// Next batch of rows (borrowed from the cursor arena — valid until
@@ -841,6 +878,7 @@ pub const Cursor = struct {
 
         _ = self.batch_arena.reset(.retain_capacity);
         self.pending = conn_mod.RowsSink.init(self.batch_arena.allocator(), self.pg.max_result_bytes);
+        self.pending.columns = self.columns;
 
         var suspended = false;
         self.conn.writeExecute(self.batch) catch |e| return self.fail(e);
@@ -850,10 +888,25 @@ pub const Cursor = struct {
             .sink = .{ .rows = &self.pending },
             .suspended = &suspended,
             .no_sync_terminator = true,
+            .result_formats = if (self.format_len > 0) self.formats[0..self.format_len] else null,
         }) catch |e| return self.fail(e);
 
         self.done = !suspended;
+        if (self.done) {
+            // Portal exhausted: close the extended-query cycle (Sync) so the
+            // connection is clean for the next user, then hand it back.
+            if (self.finish()) |_| {} else |e| return self.fail(e);
+        }
         return self.buildRows();
+    }
+
+    /// Sync + drain + release once the portal is done.
+    fn finish(self: *Cursor) errors.Error!void {
+        self.conn.writeSyncMessage() catch return error.WriteFailed;
+        self.conn.flushOut() catch return error.WriteFailed;
+        self.conn.drainToReady() catch return error.ConnectionClosed;
+        self.pg.pool.release(self.conn);
+        self.released = true;
     }
 
     fn buildRows(self: *Cursor) errors.Error!?[]Row {
@@ -863,7 +916,22 @@ pub const Cursor = struct {
     }
 
     fn fail(self: *Cursor, e: errors.Error) errors.Error {
+        self.broken = true;
         self.pg.recordDiag(self.conn);
+        // The extended-query flow is mid-sequence: Sync first, otherwise the
+        // server has no ReadyForQuery for us to drain.
+        self.conn.writeSyncMessage() catch {
+            self.pg.pool.discard(self.conn);
+            self.batch_arena.deinit();
+            self.cols_arena.deinit();
+            return e;
+        };
+        self.conn.flushOut() catch {
+            self.pg.pool.discard(self.conn);
+            self.batch_arena.deinit();
+            self.cols_arena.deinit();
+            return e;
+        };
         self.conn.drainToReady() catch {
             self.pg.pool.discard(self.conn);
             self.batch_arena.deinit();
@@ -876,17 +944,23 @@ pub const Cursor = struct {
 
     /// `sql.CLOSE` — close the cursor and return the connection.
     pub fn close(self: *Cursor) errors.Error!void {
+        defer {
+            self.batch_arena.deinit();
+            self.cols_arena.deinit();
+        }
+        if (self.broken) return error.ConnectionClosed;
+        if (self.released) return;
         if (!self.done) {
             self.conn.writeSyncMessage() catch {};
             self.conn.flushOut() catch {};
             self.conn.drainToReady() catch {
+                self.broken = true;
                 self.pg.pool.discard(self.conn);
-                self.batch_arena.deinit();
                 return error.ConnectionClosed;
             };
         }
         self.pg.pool.release(self.conn);
-        self.batch_arena.deinit();
+        self.released = true;
     }
 };
 

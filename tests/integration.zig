@@ -295,6 +295,31 @@ test {
         var cur2 = try db.cursor(1, "select id from pgz_test.users order by id", .{});
         _ = try cur2.next();
         try cur2.close();
+
+        // multiple batches: the portal is resumed, so the column metadata and
+        // the result formats must be reused (the server repeats neither)
+        {
+            var cur3 = try db.cursor(2, "select g as n, true as b, 'x' as t from generate_series(1, 5) g", .{});
+            var batches: usize = 0;
+            var seen: usize = 0;
+            var last: i32 = 0;
+            while (try cur3.next()) |batch| {
+                batches += 1;
+                try std.testing.expect(batch.len <= 2);
+                for (batch) |row| {
+                    const n = try row.getAt(i32, 0);
+                    try std.testing.expectEqual(last + 1, n);
+                    last = n;
+                    try std.testing.expectEqual(true, try row.getAt(bool, 1));
+                    try std.testing.expectEqualStrings("x", try row.getAt([]const u8, 2));
+                    try std.testing.expectEqual(n, try row.get(i32, "n"));
+                    seen += 1;
+                }
+            }
+            try cur3.close();
+            try std.testing.expectEqual(@as(usize, 5), seen);
+            try std.testing.expect(batches >= 3);
+        }
     }
 
     std.debug.print("{s}\n", .{"STEP foreach"});
@@ -425,6 +450,60 @@ test {
             error.ResultTooLarge,
             small.query("select id, name from pgz_test.users", .{}),
         );
+    }
+
+    std.debug.print("{s}\n", .{"STEP result formats"});
+    // first execution (text results) and cached execution (binary results)
+    // must decode to the same values, in both first-exec modes
+    {
+        inline for (.{ false, true }) |binary_first| {
+            const tag = if (binary_first) "binary_first_exec" else "default      ";
+            var conn = postgres(io, gpa, .{
+                .url = url(),
+                .max = 1,
+                .binary_first_exec = binary_first,
+            }) catch |e| switch (e) {
+                error.ConnectFailed, error.UnknownHostName => {
+                    skipped = true;
+                    return error.SkipDbUnavailable;
+                },
+                else => return e,
+            };
+            defer conn.deinit();
+
+            inline for (.{ 0, 1 }) |run| {
+                const label = if (run == 0) "1st" else "2nd";
+                var res = try conn.query(
+                    "select {}::int2 as a, {}::int4 as b, {}::int8 as c, " ++
+                        "{}::bool as d, null::int4 as e, {}::text as f, {}::int4 as g",
+                    .{ @as(i16, -300), @as(i32, 123456), @as(i64, -9007199254740993), true, "hello", @as(?i32, null) },
+                );
+                defer res.deinit();
+                const row = res.first().?;
+                try std.testing.expect(res.rows.len == 1);
+                try std.testing.expectEqual(@as(usize, 7), row.columns.len);
+
+                // every value must come back typed, whatever the wire format was
+                try std.testing.expectEqual(@as(i16, -300), try row.getAt(i16, 0));
+                try std.testing.expectEqual(@as(i32, 123456), try row.getAt(i32, 1));
+                try std.testing.expectEqual(@as(i64, -9007199254740993), try row.getAt(i64, 2));
+                try std.testing.expectEqual(true, try row.getAt(bool, 3));
+                try std.testing.expectEqual(@as(?i32, null), try row.getAt(?i32, 4));
+                try std.testing.expectEqualStrings("hello", try row.getAt([]const u8, 5));
+                try std.testing.expectEqual(@as(?i32, null), try row.getAt(?i32, 6));
+
+                // named lookup, optionals and genuine mismatches still behave
+                try std.testing.expectEqual(@as(i32, 123456), try row.get(i32, "b"));
+                try std.testing.expectEqual(@as(?i16, -300), try row.get(?i16, "a"));
+                try std.testing.expectError(error.TypeMismatch, row.getAt(i32, 4));
+                // unparseable text for an int target, int for a bool target
+                try std.testing.expectError(error.InvalidValue, row.getAt(i32, 5));
+                // an int that does not fit must not silently wrap
+                try std.testing.expectError(error.TypeMismatch, row.getAt(i16, 2));
+                try std.testing.expectError(error.TypeMismatch, row.getAt(bool, 1));
+                std.debug.print("  {s} {s} exec: ok\n", .{ tag, label });
+            }
+        }
     }
 
     std.debug.print("== integration: ALL PASSED ==\n", .{});

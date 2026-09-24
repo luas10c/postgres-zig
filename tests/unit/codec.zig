@@ -56,3 +56,24 @@ test "timestamp text decode" {
         (18 * 3600 + 53 * 60) * std.time.us_per_s + 500_000;
     try std.testing.expectEqual(expect_usec, ts.usec);
 }
+
+test "coerce accepts text wire values for int/bool/float" {
+    try std.testing.expectEqual(@as(i32, 42), try coerce(i32, .{ .text = "42" }));
+    try std.testing.expectEqual(@as(i16, -7), try coerce(i16, .{ .text = "-7" }));
+    try std.testing.expectEqual(@as(i64, 9007199254740993), try coerce(i64, .{ .text = "9007199254740993" }));
+    try std.testing.expectEqual(@as(u32, 7), try coerce(u32, .{ .text = "7" }));
+    try std.testing.expectEqual(@as(f64, 1.5), try coerce(f64, .{ .text = "1.5" }));
+
+    try std.testing.expectEqual(true, try coerce(bool, .{ .text = "t" }));
+    try std.testing.expectEqual(true, try coerce(bool, .{ .text = "true" }));
+    try std.testing.expectEqual(false, try coerce(bool, .{ .text = "f" }));
+    try std.testing.expectEqual(false, try coerce(bool, .{ .text = "0" }));
+
+    // unparseable text is a value error, not a type error
+    try std.testing.expectError(error.InvalidValue, coerce(i32, .{ .text = "hello" }));
+    try std.testing.expectError(error.InvalidValue, coerce(bool, .{ .text = "maybe" }));
+    // out of range stays a type error, and other kinds are still rejected
+    try std.testing.expectError(error.TypeMismatch, coerce(i16, .{ .int = 40000 }));
+    try std.testing.expectError(error.TypeMismatch, coerce(i32, .{ .bool_ = true }));
+    try std.testing.expectError(error.TypeMismatch, coerce(i32, .{ .uuid = [_]u8{0} ** 16 }));
+}

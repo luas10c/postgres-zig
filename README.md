@@ -232,6 +232,7 @@ var db = try postgres(io, gpa, .{
     .connect_timeout = 30 * std.time.ns_per_s,
     .query_timeout = 5 * std.time.ns_per_s, // CancelRequest no deadline
     .prepare = true, // prepared statements (desligue p/ PgBouncer txn mode)
+    .binary_first_exec = false, // 1a execução em binário (custa 1 round trip a mais por statement novo)
     .target_session_attrs = .any, // .read_write | .primary | ...
     .deny_unsafe = true, // rejeita db.unsafe()/pg.raw() — recomendado em prod
     .allow_insecure_auth = false, // opt-in p/ MD5/cleartext (SCRAM é default)

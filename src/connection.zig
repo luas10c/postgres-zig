@@ -37,6 +37,7 @@ pub const ConnCtx = struct {
     allow_insecure_auth: bool,
     max_message_bytes: usize,
     max_result_bytes: usize,
+    binary_first_exec: bool,
 };
 
 /// Messages sent by the backend.
@@ -273,6 +274,8 @@ pub const Conn = struct {
     last_n_result: usize = 0,
     last_result_overflow: bool = true,
     last_result_formats: [max_cached_columns]u8 = undefined,
+    /// How many formats the last Bind requested (0 = all text).
+    last_exec_format_len: usize = 0,
     cache_clock: u32 = 0,
     cache_len: usize = 0,
 
@@ -887,6 +890,17 @@ pub const Conn = struct {
 
     fn cacheInsert(c: *Conn, name: []const u8, oids: []const u32) void {
         if (name.len != 20 or oids.len > max_cached_params) return;
+        c.cache_clock += 1;
+        if (c.cacheFind(name, oids)) |existing| {
+            existing.lru = c.cache_clock;
+            if (c.last_result_overflow) {
+                existing.n_result = unknown_result_cols;
+            } else {
+                existing.n_result = @intCast(c.last_n_result);
+                for (c.last_result_oids[0..c.last_n_result], 0..) |o, i| existing.result_oids[i] = o;
+            }
+            return;
+        }
         var slot: *CacheEntry = undefined;
         if (c.cache_len < max_statement_cache) {
             c.cache[c.cache_len] = .{ .name = undefined, .n_oids = 0, .oids = undefined, .lru = 0 };
@@ -915,7 +929,6 @@ pub const Conn = struct {
             entry.n_result = @intCast(c.last_n_result);
             for (c.last_result_oids[0..c.last_n_result], 0..) |o, i| entry.result_oids[i] = o;
         }
-        c.cache_clock += 1;
         entry.lru = c.cache_clock;
     }
 
@@ -1167,8 +1180,54 @@ pub const Conn = struct {
             const n = @min(roids.len, max_cached_columns);
             for (roids[0..n], 0..) |o, i| c.last_result_formats[i] = if (types.binResultOid(o)) 1 else 0;
             eo_mut.result_formats = c.last_result_formats[0..n];
+            c.last_exec_format_len = n;
         } else {
             eo_mut.result_formats = null;
+            c.last_exec_format_len = 0;
+        }
+
+        if (!cached and want_prepare and c.ctx.binary_first_exec and !eo.no_execute) {
+            // Two phases on a cache miss: Parse+Describe+Sync learns the result
+            // OIDs, then Bind can request binary exactly like a cache hit.
+            // Costs one extra round trip, so it is opt-in.
+            try c.writeParse(name, sql, oids);
+            try c.writeDescribeStatement(name);
+            try c.writeSyncMessage();
+            try c.flushOut();
+            try c.readQueryResults(.{ .sink = .none });
+
+            if (!c.last_result_overflow and c.last_n_result > 0) {
+                result_oids = c.last_result_oids[0..c.last_n_result];
+            } else {
+                result_oids = null;
+            }
+            if (result_oids) |roids| {
+                const nf = @min(roids.len, max_cached_columns);
+                for (roids[0..nf], 0..) |o, i| c.last_result_formats[i] = if (types.binResultOid(o)) 1 else 0;
+                eo_mut.result_formats = c.last_result_formats[0..nf];
+                c.last_exec_format_len = nf;
+            } else {
+                eo_mut.result_formats = null;
+                c.last_exec_format_len = 0;
+            }
+            // The statement now exists server-side: record it before executing
+            // so a later failure cannot make us re-Parse the same name.
+            c.cacheInsert(name, oids);
+
+            // Describe again: Execute alone does not repeat RowDescription, and
+            // the sink needs the column metadata.
+            try c.writeDescribeStatement(name);
+            try c.writeBind(name, encs, result_oids);
+            try c.writeExecute(eo.rows_limit);
+            if (eo.use_sync) {
+                try c.writeSyncMessage();
+            } else {
+                try c.writeFlushMessage();
+            }
+            try c.flushOut();
+            try c.readQueryResults(eo_mut);
+            c.cacheInsert(name, oids);
+            return;
         }
 
         if (!cached) {
